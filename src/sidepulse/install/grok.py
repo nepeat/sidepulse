@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,19 @@ def install_grok_hooks(
         cleaned.append(grok_hook_entry(event_name, command))
         hooks[event_name] = cleaned
 
-    changed = json.dumps(data, sort_keys=True) != original
+    legacy_changed = any(
+        grok_legacy_hook_file_would_change(path, target_log)
+        for path in grok_legacy_hook_config_paths(config)
+    )
+    backup_changed = bool(grok_live_backup_hook_paths(config))
+    changed = json.dumps(data, sort_keys=True) != original or legacy_changed or backup_changed
     backup = None
     if changed and not dry_run:
         config.parent.mkdir(parents=True, exist_ok=True)
-        backup = backup_file(config)
+        backup = backup_file(config, grok_hook_backup_dir(config)) if config.exists() else None
         config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        clean_grok_legacy_hook_files(config, target_log)
+        clean_grok_live_backup_hook_files(config)
         target_log.parent.mkdir(parents=True, exist_ok=True)
         target_log.touch(exist_ok=True)
 
@@ -75,10 +83,16 @@ def uninstall_grok_hooks(
             data.pop("hooks", None)
 
     changed = json.dumps(data, sort_keys=True) != original
+    legacy_changed = any(
+        grok_legacy_hook_file_would_change(path, target_log)
+        for path in grok_legacy_hook_config_paths(config)
+    )
+    backup_changed = bool(grok_live_backup_hook_paths(config))
+    changed = changed or legacy_changed or backup_changed
     backup = None
     if changed and not dry_run:
         config.parent.mkdir(parents=True, exist_ok=True)
-        backup = backup_file(config)
+        backup = backup_file(config, grok_hook_backup_dir(config)) if config.exists() else None
         if data:
             config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
         else:
@@ -86,6 +100,8 @@ def uninstall_grok_hooks(
                 config.unlink()
             except FileNotFoundError:
                 pass
+        clean_grok_legacy_hook_files(config, target_log)
+        clean_grok_live_backup_hook_files(config)
 
     return InstallResult("grok", config, target_log, changed, backup, dry_run)
 
@@ -95,3 +111,78 @@ def grok_hook_entry(event_name: str, command: str) -> dict[str, Any]:
     if event_name in {"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionDenied", "Notification"}:
         entry["matcher"] = "*"
     return entry
+
+
+def grok_legacy_hook_config_paths(config: Path) -> tuple[Path, ...]:
+    return (config.parent / "sidepulse-agent-monitor.json", config.parent / "sidepulse-cli.json")
+
+
+def grok_hook_backup_dir(config: Path) -> Path:
+    return config.parent.parent / "sidepulse-hook-backups"
+
+
+def grok_live_backup_hook_paths(config: Path) -> tuple[Path, ...]:
+    if not config.parent.exists():
+        return ()
+    return tuple(sorted(path for path in config.parent.iterdir() if path.is_file() and path.name.startswith("sidepulse") and ".json.bak." in path.name))
+
+
+def clean_grok_live_backup_hook_files(config: Path) -> None:
+    backup_dir = grok_hook_backup_dir(config)
+    for path in grok_live_backup_hook_paths(config):
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = backup_dir / path.name
+        if destination.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            destination = backup_dir / f"{path.name}.{stamp}"
+        path.replace(destination)
+
+
+def grok_legacy_hook_file_would_change(path: Path, log_path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        data = read_json_config(path)
+    except Exception:
+        return False
+    return clean_json_hook_data(data, log_path) != data
+
+
+def clean_grok_legacy_hook_files(config: Path, log_path: Path) -> None:
+    for path in grok_legacy_hook_config_paths(config):
+        if not path.exists():
+            continue
+        try:
+            data = read_json_config(path)
+        except Exception:
+            continue
+        cleaned = clean_json_hook_data(data, log_path)
+        if cleaned == data:
+            continue
+        backup_file(path, grok_hook_backup_dir(config))
+        if cleaned:
+            path.write_text(json.dumps(cleaned, indent=2, sort_keys=False) + "\n")
+        else:
+            path.unlink()
+
+
+def clean_json_hook_data(data: dict[str, Any], log_path: Path) -> dict[str, Any]:
+    cleaned_data = dict(data)
+    hooks = cleaned_data.get("hooks")
+    if not isinstance(hooks, dict):
+        return cleaned_data
+    cleaned_hooks = dict(hooks)
+    for event_name in list(cleaned_hooks):
+        entries = cleaned_hooks.get(event_name)
+        if event_name not in GROK_EVENTS or not isinstance(entries, list):
+            continue
+        cleaned = remove_json_command_hooks_for_log(entries, log_path)
+        if cleaned:
+            cleaned_hooks[event_name] = cleaned
+        else:
+            cleaned_hooks.pop(event_name, None)
+    if cleaned_hooks:
+        cleaned_data["hooks"] = cleaned_hooks
+    else:
+        cleaned_data.pop("hooks", None)
+    return cleaned_data

@@ -41,7 +41,7 @@ def hook_command(
 ) -> str:
     executable = python_executable or sys.executable or "python3"
     if getattr(sys, "frozen", False) and python_executable is None:
-        return " ".join(
+        command = " ".join(
             [
                 shlex.quote(executable),
                 "agent-monitor",
@@ -52,6 +52,7 @@ def hook_command(
                 shlex.quote(str(log_path.expanduser())),
             ]
         )
+        return fail_open_command(command)
     entry_point = _PACKAGE_DIR / "hook_entry.py"
     command = " ".join(
         [
@@ -63,7 +64,11 @@ def hook_command(
             shlex.quote(str(log_path.expanduser())),
         ]
     )
-    return command
+    return fail_open_command(command)
+
+
+def fail_open_command(command: str) -> str:
+    return f"{command} ; true"
 
 
 def hook_pythonpath_assignment() -> str:
@@ -104,11 +109,13 @@ def remove_json_command_hooks_for_log(entries: list[Any], log_path: Path) -> lis
     return cleaned_entries
 
 
-def backup_file(path: Path) -> Path | None:
+def backup_file(path: Path, backup_dir: Path | None = None) -> Path | None:
     if not path.exists():
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = path.with_name(f"{path.name}.bak.{stamp}")
+    target_dir = backup_dir or path.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    backup = target_dir / f"{path.name}.bak.{stamp}"
     backup.write_bytes(path.read_bytes())
     return backup
 

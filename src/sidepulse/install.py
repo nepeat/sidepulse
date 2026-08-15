@@ -284,6 +284,10 @@ def hermes_hooks_region(lines: list[str]) -> tuple[int, int] | None:
     for index in range(header + 1, len(lines)):
         line = lines[index]
         if line.strip() and not line.startswith((" ", "\t")):
+            # Column-0 comments don't end the block, but only count toward the
+            # region if indented content follows them.
+            if line.startswith("#"):
+                continue
             break
         end = index + 1
     return header + 1, end
@@ -310,6 +314,8 @@ def insert_hermes_hook_block(text: str, block: str) -> str:
     if header is None:
         return _ensure_trailing_newline(text) + "\nhooks:\n" + block
 
+    if not lines[header].endswith("\n"):
+        lines[header] += "\n"
     lines.insert(header + 1, block)
     return "".join(lines)
 
